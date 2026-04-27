@@ -51,6 +51,10 @@ There is no separate plugin required for importer UI.
 
 ## Current Placement Transform Setup
 
+### Landscape 
+- Global XY offset: `X=-0`, `Y=-0`
+- Global Z offset: `Z=-0`
+
 ### GRP
 
 - Global group yaw: `+90` (Z axis)
