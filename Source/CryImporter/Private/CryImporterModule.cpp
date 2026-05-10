@@ -1,4 +1,4 @@
-﻿#include "CryImporterModule.h"
+#include "CryImporterModule.h"
 
 #include "AssetToolsModule.h"
 #include "AssetImportTask.h"
@@ -15,6 +15,7 @@
 #include "Components/StaticMeshComponent.h"
 #include "Framework/Docking/TabManager.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "IDesktopPlatform.h"
@@ -67,6 +68,10 @@ namespace CryImporter
     {
         InPath.ReplaceInline(TEXT("\\"), TEXT("/"));
         InPath = InPath.ToLower();
+        while (InPath.Contains(TEXT("//")))
+        {
+            InPath.ReplaceInline(TEXT("//"), TEXT("/"));
+        }
 
         while (InPath.RemoveFromStart(TEXT("/")))
         {
@@ -76,7 +81,7 @@ namespace CryImporter
         {
         }
 
-        if (InPath.EndsWith(TEXT(".cgf")))
+        if (InPath.EndsWith(TEXT(".cgf")) || InPath.EndsWith(TEXT(".cga")) || InPath.EndsWith(TEXT(".bld")))
         {
             InPath = FPaths::GetPath(InPath) / FPaths::GetBaseFilename(InPath);
         }
@@ -99,6 +104,64 @@ namespace CryImporter
         return InPath;
     }
 
+    static FString ExtractEntityModelPathFromNode(const FXmlNode* Node)
+    {
+        if (!Node)
+        {
+            return FString();
+        }
+
+        // Cry entity-placed static meshes are commonly stored under child properties
+        // rather than Object Prefab (for example objModel/fileModel/model).
+        static const TCHAR* CandidateKeys[] = {
+            TEXT("objModel"),
+            TEXT("fileModel"),
+            TEXT("fileModel01"),
+            TEXT("fileModel1"),
+            TEXT("fileModel2"),
+            TEXT("fileModel3"),
+            TEXT("fileGunModel"),
+            TEXT("fileHelmetModel"),
+            TEXT("fileObject"),
+            TEXT("model"),
+            TEXT("Model"),
+            TEXT("object_Model"),
+            TEXT("object_ModelDestroyed"),
+            TEXT("geometry"),
+            TEXT("Geometry")
+        };
+
+        for (const TCHAR* Key : CandidateKeys)
+        {
+            const FString Value = Node->GetAttribute(Key).TrimStartAndEnd();
+            if (!Value.IsEmpty())
+            {
+                return Value;
+            }
+        }
+
+        for (const FXmlNode* ChildNode : Node->GetChildrenNodes())
+        {
+            if (!ChildNode)
+            {
+                continue;
+            }
+
+            const FString ChildValue = ExtractEntityModelPathFromNode(ChildNode);
+            if (!ChildValue.IsEmpty())
+            {
+                return ChildValue;
+            }
+        }
+
+        return FString();
+    }
+
+    static FString ExtractEntityModelPath(const FXmlNode* ObjectNode)
+    {
+        return ExtractEntityModelPathFromNode(ObjectNode);
+    }
+
     static FString NormalizeNameKey(FString InName)
     {
         InName = InName.ToLower();
@@ -112,6 +175,167 @@ namespace CryImporter
         }
 
         return InName;
+    }
+
+    static FString NormalizePrototypeId(FString InId)
+    {
+        InId = InId.TrimStartAndEnd().ToLower();
+        InId.RemoveFromStart(TEXT("{"));
+        InId.RemoveFromEnd(TEXT("}"));
+        return InId;
+    }
+
+    static FString StripEntityInstanceNumber(FString InName)
+    {
+        InName = InName.TrimStartAndEnd();
+        int32 EndIndex = InName.Len();
+        while (EndIndex > 0 && FChar::IsDigit(InName[EndIndex - 1]))
+        {
+            --EndIndex;
+        }
+
+        return EndIndex > 0 ? InName.Left(EndIndex) : InName;
+    }
+
+    struct FEntityPrototypeModelMaps
+    {
+        TMap<FString, FString> ModelByPrototypeId;
+        TMap<FString, FString> ModelByName;
+        int32 LoadedPrototypeCount = 0;
+        int32 LoadedFileCount = 0;
+        int32 EmbeddedPrototypeCount = 0;
+    };
+
+    struct FEmbeddedEntityPrototypeModelEntry
+    {
+        const TCHAR* PrototypeId;
+        const TCHAR* Name;
+        const TCHAR* ModelPath;
+    };
+
+#include "CryEntityPrototypeModels.inl"
+
+    static void AddEntityPrototypeModelMapping(
+        FEntityPrototypeModelMaps& OutMaps,
+        const FString& PrototypeId,
+        const FString& PrototypeName,
+        const FString& ModelPath)
+    {
+        if (ModelPath.IsEmpty())
+        {
+            return;
+        }
+
+        const FString NormalizedPrototypeId = NormalizePrototypeId(PrototypeId);
+        if (!NormalizedPrototypeId.IsEmpty())
+        {
+            OutMaps.ModelByPrototypeId.Add(NormalizedPrototypeId, ModelPath);
+        }
+
+        const FString CleanPrototypeName = PrototypeName.TrimStartAndEnd();
+        if (!CleanPrototypeName.IsEmpty())
+        {
+            OutMaps.ModelByName.Add(NormalizeNameKey(CleanPrototypeName), ModelPath);
+        }
+    }
+
+    static void AddEmbeddedEntityPrototypeModels(FEntityPrototypeModelMaps& OutMaps)
+    {
+        for (const FEmbeddedEntityPrototypeModelEntry& Entry : GEmbeddedEntityPrototypeModels)
+        {
+            AddEntityPrototypeModelMapping(OutMaps, Entry.PrototypeId, Entry.Name, Entry.ModelPath);
+            ++OutMaps.EmbeddedPrototypeCount;
+        }
+    }
+
+    static void AddEntityLibraryCandidateDirectories(const FString& GRPFilePath, TArray<FString>& OutDirectories)
+    {
+        auto AddDirectory = [&OutDirectories](const FString& Directory)
+        {
+            if (!Directory.IsEmpty() && IFileManager::Get().DirectoryExists(*Directory))
+            {
+                OutDirectories.AddUnique(FPaths::ConvertRelativePathToFull(Directory));
+            }
+        };
+
+        const FString GRPDirectory = FPaths::GetPath(GRPFilePath);
+        AddDirectory(FPaths::Combine(GRPDirectory, TEXT("../../Editor/EntityLibrary")));
+        AddDirectory(FPaths::Combine(GRPDirectory, TEXT("../../../Editor/EntityLibrary")));
+        AddDirectory(TEXT("E:/GamesLibrary/nosteam/Far Cry/Editor/EntityLibrary"));
+    }
+
+    static void LoadEntityPrototypeModelsFromNode(
+        const FXmlNode* Node,
+        FEntityPrototypeModelMaps& OutMaps)
+    {
+        if (!Node)
+        {
+            return;
+        }
+
+        if (Node->GetTag() == TEXT("EntityPrototype"))
+        {
+            const FString ModelPath = ExtractEntityModelPath(Node);
+            if (!ModelPath.IsEmpty())
+            {
+                const FString PrototypeName = Node->GetAttribute(TEXT("Name")).TrimStartAndEnd();
+                const FString PrototypeId = NormalizePrototypeId(Node->GetAttribute(TEXT("Id")));
+
+                AddEntityPrototypeModelMapping(OutMaps, PrototypeId, PrototypeName, ModelPath);
+                ++OutMaps.LoadedPrototypeCount;
+            }
+        }
+
+        for (const FXmlNode* ChildNode : Node->GetChildrenNodes())
+        {
+            LoadEntityPrototypeModelsFromNode(ChildNode, OutMaps);
+        }
+    }
+
+    static FEntityPrototypeModelMaps LoadEntityPrototypeModelMaps(const FString& GRPFilePath)
+    {
+        FEntityPrototypeModelMaps Maps;
+        AddEmbeddedEntityPrototypeModels(Maps);
+
+        TArray<FString> EntityLibraryDirectories;
+        AddEntityLibraryCandidateDirectories(GRPFilePath, EntityLibraryDirectories);
+
+        TArray<FString> XmlFiles;
+        for (const FString& Directory : EntityLibraryDirectories)
+        {
+            TArray<FString> DirectoryXmlFiles;
+            IFileManager::Get().FindFilesRecursive(
+                DirectoryXmlFiles,
+                *Directory,
+                TEXT("*.xml"),
+                true,
+                false);
+
+            for (const FString& XmlFilePath : DirectoryXmlFiles)
+            {
+                XmlFiles.AddUnique(XmlFilePath);
+            }
+        }
+
+        for (const FString& XmlFilePath : XmlFiles)
+        {
+            FString XmlContent;
+            if (!FFileHelper::LoadFileToString(XmlContent, *XmlFilePath))
+            {
+                continue;
+            }
+
+            FXmlFile XmlFile(XmlContent, EConstructMethod::ConstructFromBuffer);
+            if (!XmlFile.IsValid() || !XmlFile.GetRootNode())
+            {
+                continue;
+            }
+
+            ++Maps.LoadedFileCount;
+            LoadEntityPrototypeModelsFromNode(XmlFile.GetRootNode(), Maps);
+        }
+
+        return Maps;
     }
 
     static FString SanitizeAssetSearchRootPath(FString InPath)
@@ -2455,6 +2679,16 @@ void FCryImporterModule::ImportGRP(const FString& FilePath)
     TMap<FString, FTransform> WorldTransformByObjectId;
     const FQuat GlobalYawQuat(FVector::UpVector, FMath::DegreesToRadians(CryImporter::GlobalYawOffsetDeg));
     int32 DebugLoggedTransforms = 0;
+    int32 DebugLoggedUnresolved = 0;
+    int32 ObjectModelPathCount = 0;
+    int32 EntityModelPathCount = 0;
+    int32 EntityPrototypeLibraryPathCount = 0;
+    int32 EntityWithoutModelPathCount = 0;
+    int32 ResolvedMeshCount = 0;
+    int32 UnresolvedMeshCount = 0;
+    int32 SpawnedActorCount = 0;
+    const CryImporter::FEntityPrototypeModelMaps EntityPrototypeModelMaps =
+        CryImporter::LoadEntityPrototypeModelMaps(FilePath);
 
     FAssetRegistryModule& AssetRegistryModule =
         FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
@@ -2499,7 +2733,47 @@ void FCryImporterModule::ImportGRP(const FString& FilePath)
 
         if (Node->GetTag() == TEXT("Object"))
         {
-            const FString PrefabPath = Node->GetAttribute(TEXT("Prefab"));
+            const FString TypeString = Node->GetAttribute(TEXT("Type"));
+            const bool bEntityLike = TypeString.Contains(TEXT("Entity"));
+            const FString ObjectName = Node->GetAttribute(TEXT("Name"));
+            const FString PrototypeId = CryImporter::NormalizePrototypeId(Node->GetAttribute(TEXT("Prototype")));
+            FString PrefabPath = Node->GetAttribute(TEXT("Prefab"));
+            if (PrefabPath.IsEmpty())
+            {
+                PrefabPath = CryImporter::ExtractEntityModelPath(Node);
+                if (!PrefabPath.IsEmpty())
+                {
+                    ++EntityModelPathCount;
+                }
+                else if (bEntityLike)
+                {
+                    if (!PrototypeId.IsEmpty())
+                    {
+                        if (const FString* FoundByPrototypeId = EntityPrototypeModelMaps.ModelByPrototypeId.Find(PrototypeId))
+                        {
+                            PrefabPath = *FoundByPrototypeId;
+                        }
+                    }
+
+                    if (PrefabPath.IsEmpty() && !ObjectName.IsEmpty())
+                    {
+                        const FString PrototypeNameKey = CryImporter::NormalizeNameKey(CryImporter::StripEntityInstanceNumber(ObjectName));
+                        if (const FString* FoundByPrototypeName = EntityPrototypeModelMaps.ModelByName.Find(PrototypeNameKey))
+                        {
+                            PrefabPath = *FoundByPrototypeName;
+                        }
+                    }
+
+                    if (!PrefabPath.IsEmpty())
+                    {
+                        ++EntityPrototypeLibraryPathCount;
+                    }
+                }
+                if (PrefabPath.IsEmpty() && bEntityLike)
+                {
+                    ++EntityWithoutModelPathCount;
+                }
+            }
             const FString PosString = Node->GetAttribute(TEXT("Pos"));
             const FString AnglesString = Node->GetAttribute(TEXT("Angles"));
             const FString ScaleString = Node->GetAttribute(TEXT("Scale"));
@@ -2510,6 +2784,7 @@ void FCryImporterModule::ImportGRP(const FString& FilePath)
 
             if (!PrefabPath.IsEmpty())
             {
+                ++ObjectModelPathCount;
                 if (bSkipCollisionLikeGeometry
                     && (CryImporter::IsCollisionLikeMarker(PrefabPath) || CryImporter::IsCollisionLikeMarker(MaterialString)))
                 {
@@ -2559,6 +2834,7 @@ void FCryImporterModule::ImportGRP(const FString& FilePath)
 
                 if (SelectedMesh)
                 {
+                    ++ResolvedMeshCount;
                     FVector CryPos = FVector::ZeroVector;
                     const bool bHasExplicitPos = CryImporter::ParseVector3Csv(PosString, CryPos);
                     const FVector LocalPosition = bHasExplicitPos
@@ -2662,6 +2938,7 @@ void FCryImporterModule::ImportGRP(const FString& FilePath)
                     AStaticMeshActor* Actor = World->SpawnActor<AStaticMeshActor>(Location, Rotation);
                     if (Actor)
                     {
+                        ++SpawnedActorCount;
                         Actor->SetFlags(RF_Transactional);
                         Actor->Modify();
 
@@ -2689,6 +2966,19 @@ void FCryImporterModule::ImportGRP(const FString& FilePath)
                         }
                     }
                 }
+                else
+                {
+                    ++UnresolvedMeshCount;
+                    if (DebugLoggedUnresolved < 25)
+                    {
+                        UE_LOG(LogTemp, Warning,
+                            TEXT("CryImporter: No StaticMesh match for GRP object '%s' Type='%s' Model='%s'. Check Asset Search Root or imported mesh names."),
+                            *ObjectName,
+                            *TypeString,
+                            *PrefabPath);
+                        ++DebugLoggedUnresolved;
+                    }
+                }
             }
         }
 
@@ -2699,6 +2989,21 @@ void FCryImporterModule::ImportGRP(const FString& FilePath)
     };
 
     ParseNode(RootNode);
+    UE_LOG(LogTemp, Display,
+        TEXT("CryImporter: GRP import summary for '%s': model paths=%d, entity direct model paths=%d, entity prototype-library paths=%d, entity without model path=%d, resolved meshes=%d, unresolved meshes=%d, spawned actors=%d, assets scanned=%d, embedded entity prototypes=%d, entity library files=%d, entity library prototypes=%d, AssetSearchRoot='%s'."),
+        *FPaths::GetCleanFilename(FilePath),
+        ObjectModelPathCount,
+        EntityModelPathCount,
+        EntityPrototypeLibraryPathCount,
+        EntityWithoutModelPathCount,
+        ResolvedMeshCount,
+        UnresolvedMeshCount,
+        SpawnedActorCount,
+        AssetList.Num(),
+        EntityPrototypeModelMaps.EmbeddedPrototypeCount,
+        EntityPrototypeModelMaps.LoadedFileCount,
+        EntityPrototypeModelMaps.LoadedPrototypeCount,
+        *SearchRoot);
 }
 
 void FCryImporterModule::ImportVEG(const FString& FilePath)
